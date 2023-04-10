@@ -7,7 +7,9 @@ from typing import Dict, List
 import importlib
 
 import openai
-import pinecone
+import chromadb
+from chromadb.config import Settings
+
 from dotenv import load_dotenv
 
 # Load default environment variables (.env)
@@ -29,22 +31,18 @@ if "gpt-4" in OPENAI_API_MODEL.lower():
         + "\033[0m\033[0m"
     )
 
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
-assert PINECONE_API_KEY, "PINECONE_API_KEY environment variable is missing from .env"
-
-PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT", "")
-assert (
-    PINECONE_ENVIRONMENT
-), "PINECONE_ENVIRONMENT environment variable is missing from .env"
-
-# Table config
-YOUR_TABLE_NAME = os.getenv("TABLE_NAME", "")
-assert YOUR_TABLE_NAME, "TABLE_NAME environment variable is missing from .env"
+# COLLECTION config
+YOUR_COLLECTION_NAME = os.getenv("COLLECTION_NAME", "")
+assert YOUR_COLLECTION_NAME, "COLLECTION_NAME environment variable is missing from .env"
 
 # Goal configuation
 OBJECTIVE = os.getenv("OBJECTIVE", "")
 INITIAL_TASK = os.getenv("INITIAL_TASK", os.getenv("FIRST_TASK", ""))
 
+# ChromaDB configuration
+CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./flux/")
+CHROMA_HOST = os.getenv("CHROMA_HOST", "")
+CHROMA_PORT = os.getenv("CHROMA_PORT", "8000")
 
 # Extensions support begin
 
@@ -85,6 +83,8 @@ if DOTENV_EXTENSIONS:
 # Check if we know what we are doing
 assert OBJECTIVE, "OBJECTIVE environment variable is missing from .env"
 assert INITIAL_TASK, "INITIAL_TASK environment variable is missing from .env"
+assert CHROMA_PERSIST_DIR, "CHROMA_PERSIST_DIR environment variable is missing from .env"
+assert CHROMA_HOST, "CHROMA_HOST environment variable is missing from .env"
 
 if "gpt-4" in OPENAI_API_MODEL.lower():
     print(
@@ -99,22 +99,30 @@ print(f"{OBJECTIVE}")
 
 print("\033[93m\033[1m" + "\nInitial task:" + "\033[0m\033[0m" + f" {INITIAL_TASK}")
 
-# Configure OpenAI and Pinecone
+# Configure OpenAI and ChromaDB
 openai.api_key = OPENAI_API_KEY
-pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENVIRONMENT)
 
-# Create Pinecone index
-table_name = YOUR_TABLE_NAME
-dimension = 1536
-metric = "cosine"
-pod_type = "p1"
-if table_name not in pinecone.list_indexes():
-    pinecone.create_index(
-        table_name, dimension=dimension, metric=metric, pod_type=pod_type
+chroma_config = Settings(
+                    chroma_api_impl="rest",
+                    chroma_server_host=CHROMA_HOST,
+                    chroma_server_http_port=CHROMA_PORT
+                ) if len(CHROMA_HOST)>0 else Settings(
+    chroma_db_impl="duckdb+parquet",
+    persist_directory=CHROMA_PERSIST_DIR # Optional, defaults to .chromadb/ in the current directory
+)
+
+client = chromadb.Client(chroma_config)
+
+# Create ChromaDB index
+COLLECTION_name = YOUR_COLLECTION_NAME
+
+if COLLECTION_name not in client.list_collections():
+    client.create_collection(
+        COLLECTION_name
     )
 
 # Connect to the index
-index = pinecone.Index(table_name)
+collection = client.get_collection(COLLECTION_name)
 
 # Task list
 task_list = deque([])
@@ -226,7 +234,7 @@ def execution_agent(objective: str, task: str) -> str:
 
 def context_agent(query: str, n: int):
     query_embedding = get_ada_embedding(query)
-    results = index.query(query_embedding, top_k=n, include_metadata=True, namespace=OBJECTIVE)
+    results = collection.query(query_embedding, top_k=n, include_metadata=True, namespace=OBJECTIVE)
     # print("***** RESULTS *****")
     # print(results)
     sorted_results = sorted(results.matches, key=lambda x: x.score, reverse=True)
@@ -257,7 +265,7 @@ while True:
         print("\033[93m\033[1m" + "\n*****TASK RESULT*****\n" + "\033[0m\033[0m")
         print(result)
 
-        # Step 2: Enrich result and store in Pinecone
+        # Step 2: Enrich result and store in ChromaDB
         enriched_result = {
             "data": result
         }  # This is where you should enrich the result if needed
@@ -265,7 +273,7 @@ while True:
         vector = get_ada_embedding(
             enriched_result["data"]
         )  # get vector of the actual result extracted from the dictionary
-        index.upsert(
+        collection.add(
             [(result_id, vector, {"task": task["task_name"], "result": result})],
 	    namespace=OBJECTIVE
         )
